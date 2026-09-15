@@ -1,0 +1,192 @@
+package com.fiap.bank.atm.domain.model;
+
+import com.fiap.bank.atm.domain.exception.*;
+import java.time.LocalDateTime;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
+import java.util.Objects;
+import java.util.UUID;
+
+public class Account extends BaseEntity {
+    private static final int MAX_FAILED_ATTEMPTS = 3;
+
+    private final String accountNumber;
+    private final String pin;
+    private Money balance;
+    private final Money dailyWithdrawalLimit;
+    private Money totalWithdrawnToday;
+    private boolean blocked;
+    private int failedAttempts;
+    private final List<Transaction> transactions;
+
+    public Account(UUID id, String accountNumber, String pin, Money initialBalance, Money dailyWithdrawalLimit) {
+        super(id);
+        this.accountNumber = Objects.requireNonNull(accountNumber, "Account number cannot be null");
+        this.pin = Objects.requireNonNull(pin, "PIN cannot be null");
+        this.balance = Objects.requireNonNull(initialBalance, "Initial balance cannot be null");
+        this.dailyWithdrawalLimit = Objects.requireNonNull(dailyWithdrawalLimit, "Daily limit cannot be null");
+        this.totalWithdrawnToday = Money.ZERO;
+        this.blocked = false;
+        this.failedAttempts = 0;
+        this.transactions = new ArrayList<>();
+    }
+
+    // Construtor de reconstituição (usado exclusivamente pelos repositórios ao
+    // remontar uma conta a partir de uma linha do banco de dados). Diferente do
+    // construtor acima, ele aceita o estado JÁ ACUMULADO da conta (saldo atual,
+    // total sacado hoje, bloqueio, tentativas falhas e datas de auditoria), em
+    // vez de sempre inicializar como uma conta nova. As transações são carregadas
+    // depois, via seedTransaction(), pelo próprio repositório.
+    public Account(UUID id, String accountNumber, String pin, Money balance, Money dailyWithdrawalLimit,
+            Money totalWithdrawnToday, boolean blocked, int failedAttempts,
+            LocalDateTime createdAt, LocalDateTime updatedAt) {
+        super(id, createdAt, updatedAt);
+        this.accountNumber = Objects.requireNonNull(accountNumber, "Account number cannot be null");
+        this.pin = Objects.requireNonNull(pin, "PIN cannot be null");
+        this.balance = Objects.requireNonNull(balance, "Balance cannot be null");
+        this.dailyWithdrawalLimit = Objects.requireNonNull(dailyWithdrawalLimit, "Daily limit cannot be null");
+        this.totalWithdrawnToday = Objects.requireNonNull(totalWithdrawnToday, "Total withdrawn today cannot be null");
+        this.blocked = blocked;
+        this.failedAttempts = failedAttempts;
+        this.transactions = new ArrayList<>();
+    }
+
+    public String getAccountNumber() {
+        return accountNumber;
+    }
+
+    public String getPin() {
+        return pin;
+    }
+
+    public Money getBalance() {
+        return balance;
+    }
+
+    public Money getDailyWithdrawalLimit() {
+        return dailyWithdrawalLimit;
+    }
+
+    public Money getTotalWithdrawnToday() {
+        return totalWithdrawnToday;
+    }
+
+    public boolean isBlocked() {
+        return blocked;
+    }
+
+    public int getFailedAttempts() {
+        return failedAttempts;
+    }
+
+    public List<Transaction> getTransactions() {
+        return Collections.unmodifiableList(transactions);
+    }
+
+    public void authenticate(String pinAttempt) {
+        if (blocked) {
+            throw new AccountBlockedException("Esta conta está bloqueada por excesso de tentativas de senha.");
+        }
+
+        if (!this.pin.equals(pinAttempt)) {
+            failedAttempts++;
+            if (failedAttempts >= MAX_FAILED_ATTEMPTS) {
+                blocked = true;
+                throw new AccountBlockedException(
+                        "Conta bloqueada após " + MAX_FAILED_ATTEMPTS + " tentativas incorretas.");
+            }
+            throw new InvalidPinException(
+                    "Senha incorreta. Tentativa " + failedAttempts + " de " + MAX_FAILED_ATTEMPTS + ".");
+        }
+
+        failedAttempts = 0; // Reset attempts on successful login
+    }
+
+    public void withdraw(Money amount) {
+        if (blocked) {
+            throw new AccountBlockedException("Operação não permitida: conta bloqueada.");
+        }
+
+        if (amount.isLessThan(Money.of(0.01))) {
+            throw new IllegalArgumentException("O valor do saque deve ser maior que zero.");
+        }
+
+        if (amount.isGreaterThan(balance)) {
+            throw new InsufficientFundsException(
+                    "Saldo insuficiente para realizar o saque. Saldo disponível: " + balance);
+        }
+
+        Money projectedWithdrawal = totalWithdrawnToday.plus(amount);
+        if (projectedWithdrawal.isGreaterThan(dailyWithdrawalLimit)) {
+            throw new DailyLimitExceededException("Limite diário de saque excedido. Limite restante hoje: "
+                    + dailyWithdrawalLimit.minus(totalWithdrawnToday));
+        }
+
+        balance = balance.minus(amount);
+        totalWithdrawnToday = totalWithdrawnToday.plus(amount);
+
+        transactions.add(new Transaction(UUID.randomUUID(), TransactionType.WITHDRAWAL, amount, "Saque eletrônico"));
+    }
+
+    public void deposit(Money amount) {
+        if (blocked) {
+            throw new AccountBlockedException("Operação não permitida: conta bloqueada.");
+        }
+
+        if (amount.isLessThan(Money.of(0.01))) {
+            throw new IllegalArgumentException("O valor do depósito deve ser maior que zero.");
+        }
+
+        balance = balance.plus(amount);
+        transactions.add(new Transaction(UUID.randomUUID(), TransactionType.DEPOSIT, amount, "Depósito em dinheiro"));
+    }
+
+    public void transfer(Account targetAccount, Money amount) {
+        if (blocked) {
+            throw new AccountBlockedException("Operação não permitida: conta de origem bloqueada.");
+        }
+
+        if (targetAccount.isBlocked()) {
+            throw new AccountBlockedException("Operação não permitida: conta de destino está bloqueada.");
+        }
+
+        if (amount.isLessThan(Money.of(0.01))) {
+            throw new IllegalArgumentException("O valor da transferência deve ser maior que zero.");
+        }
+
+        if (amount.isGreaterThan(balance)) {
+            throw new InsufficientFundsException("Saldo insuficiente para transferência. Saldo disponível: " + balance);
+        }
+
+        if (this.accountNumber.equals(targetAccount.getAccountNumber())) {
+            throw new IllegalArgumentException("Não é possível realizar transferência para a mesma conta.");
+        }
+
+        // Debita a conta de origem
+        this.balance = this.balance.minus(amount);
+        this.transactions.add(new Transaction(
+                UUID.randomUUID(),
+                TransactionType.TRANSFER_OUT,
+                amount,
+                "Transf. para Conta " + targetAccount.getAccountNumber()));
+
+        // Credita a conta de destino
+        targetAccount.receiveTransfer(this, amount);
+    }
+
+    private void receiveTransfer(Account sourceAccount, Money amount) {
+        this.balance = this.balance.plus(amount);
+        this.transactions.add(new Transaction(
+                UUID.randomUUID(),
+                TransactionType.TRANSFER_IN,
+                amount,
+                "Transf. de Conta " + sourceAccount.getAccountNumber()));
+    }
+
+    // Helper for seeding transactions (dados de teste em memória e também usado
+    // pelos repositórios JDBC para recarregar o histórico vindo do banco).
+    public void seedTransaction(Transaction transaction) {
+        this.transactions.add(transaction);
+    }
+}
